@@ -767,6 +767,10 @@
    *  - чанк = sctp.maxMessageSize (обычно 256 КБ);
    *  - не переполняем send-буфер (ждём bufferedamountlow по событию);
    *  - читаем файл стримингом через File.slice().arrayBuffer().
+   *
+   * Побочно: детектируем узкое место. Если send-буфер стабильно забит,
+   * значит мы пишем быстрее, чем канал отправителя успевает вытеснять —
+   * потолок отдаёт наш upload (или TURN-релей, если идём через него).
    */
   async function sendItem(sess, chIdx, item) {
     const dc = sess.dataChannels[chIdx].ch;
@@ -776,6 +780,9 @@
     item.transferred = 0;
     item.localSent = 0;
     item.speedSamples = [];
+    item.bufSamples = 0;
+    item.bufFullSamples = 0;
+    item.hint = null;
     scheduleRender(item);
 
     // meta
@@ -797,6 +804,21 @@
       item.localSent = offset;
       // локальная оценка скорости — по отправленным байтам (до ack)
       bumpProgress(item, offset);
+
+      // Сэмплируем заполненность send-буфера для bottleneck-детектора.
+      item.bufSamples++;
+      if (dc.bufferedAmount > BUFFER_HIGH * 0.5) item.bufFullSamples++;
+      if (item.bufSamples >= 20 && item.bufSamples % 10 === 0) {
+        const fullRate = item.bufFullSamples / item.bufSamples;
+        if (fullRate > 0.5) {
+          item.hint = sess.via === 'через TURN'
+            ? 'потолок TURN-релея'
+            : 'потолок вашего upload';
+        } else if (item.speedBps > 50 * 1024 * 1024) {
+          item.hint = 'LAN-скорость';
+        }
+      }
+
       scheduleRender(item);
     }
     dc.send(JSON.stringify({ k: 'end', id: item.id }));
@@ -879,9 +901,10 @@
   function stateText(item) {
     const p = item.size ? Math.floor(item.transferred / item.size * 100) : 0;
     const sp = item.speedBps > 0 ? ` · ${fmt(item.speedBps)}/s` : '';
+    const hint = item.hint ? ` · ${item.hint}` : '';
     switch (item.state) {
       case 'queued':    return 'в очереди';
-      case 'sending':   return `отправка ${p}%${sp}`;
+      case 'sending':   return `отправка ${p}%${sp}${hint}`;
       case 'receiving': return `получение ${p}%${sp}`;
       case 'ack':       return '✓ принято';
       case 'received':  return '✓ получено';
